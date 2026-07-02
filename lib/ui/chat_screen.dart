@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../services/llm_service.dart';
+import '../services/tools.dart';
+import 'settings_screen.dart';
 
 class _ChatMessage {
   _ChatMessage({required this.isUser, required this.text});
@@ -19,7 +21,7 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final _llm = LlmService();
+  final _llm = LlmService(tools: availableTools(), toolExecutor: executeTool);
   final _textController = TextEditingController();
   final _scrollController = ScrollController();
   final List<_ChatMessage> _messages = [];
@@ -68,14 +70,32 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       _messages.add(_ChatMessage(isUser: true, text: text));
-      _messages.add(_ChatMessage(isUser: false, text: ''));
+      _messages.add(_ChatMessage(isUser: false, text: '考え中...'));
       _isGenerating = true;
     });
     _scrollToBottom();
 
     try {
-      await for (final token in _llm.sendMessage(text)) {
-        setState(() => _messages.last.text += token);
+      var startedAnswer = false;
+      await for (final event in _llm.sendMessage(text)) {
+        switch (event) {
+          case AgentToken(:final text):
+            setState(() {
+              if (!startedAnswer) {
+                _messages.last.text = '';
+                startedAnswer = true;
+              }
+              _messages.last.text += text;
+            });
+          case AgentToolCall(:final name, :final args):
+            startedAnswer = false;
+            final query = args['query']?.toString();
+            setState(() {
+              _messages.last.text = (name == 'web_search' && query != null && query.isNotEmpty)
+                  ? '「$query」を検索中...'
+                  : '検索中...';
+            });
+        }
         _scrollToBottom();
       }
     } catch (e) {
@@ -107,7 +127,17 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ぐちりん')),
+      appBar: AppBar(
+        title: const Text('ぐちりん'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+            ),
+          ),
+        ],
+      ),
       body: switch (_status) {
         _ModelStatus.checking => const Center(child: CircularProgressIndicator()),
         _ModelStatus.needsDownload => _buildDownloadPrompt(),
