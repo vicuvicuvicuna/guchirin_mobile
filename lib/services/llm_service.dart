@@ -57,6 +57,18 @@ class LlmService {
   // forever.
   static const maxAgentSteps = 4;
 
+  // Mirrors backend/config.py's MAX_HISTORY_MESSAGES (20), which the backend
+  // replays into every request since Ollama calls are stateless. Here it's
+  // replayed once when a session is opened (see resetChat below). Halved
+  // versus the backend because contextWindow is already halved (8192 vs
+  // 16384), and because InferenceChat's own token bookkeeping only counts
+  // images and generated output, not replayed query text — its automatic
+  // context-trimming safety net won't catch an oversized replay, so this has
+  // to be bounded here. Starting point; tune down if replay is slow or gets
+  // truncated in practice.
+  static const historyReplayLimit = 10;
+  static const historyReplayMaxCharsPerMessage = 1000;
+
   static const _systemInstruction =
       '回答は要点を絞り、必要十分な長さで簡潔に答えてください。'
       '過剰な見出し・箇条書き・表・絵文字の多用は避け、自然な文章を基本としてください。'
@@ -83,10 +95,9 @@ class LlmService {
     return controller.stream;
   }
 
-  Future<void> _ensureChatReady() async {
-    if (_chat != null) return;
-    _model = await FlutterGemma.getActiveModel(maxTokens: contextWindow);
-    _chat = await _model!.createChat(
+  Future<InferenceChat> _createChat() async {
+    _model ??= await FlutterGemma.getActiveModel(maxTokens: contextWindow);
+    return _model!.createChat(
       modelType: modelType,
       maxOutputTokens: answerMaxTokens,
       systemInstruction: _systemInstruction,
@@ -95,6 +106,23 @@ class LlmService {
       toolChoice: ToolChoice.auto,
     );
   }
+
+  /// Defensive fallback used by [sendMessage] in case no session was ever
+  /// explicitly opened via [resetChat].
+  Future<void> _ensureChatReady() async {
+    _chat ??= await _createChat();
+  }
+
+  /// Discards the current conversation/KV-cache (if any) and starts a fresh
+  /// one on the same loaded model — no reload of model weights. [history] is
+  /// replayed turn-by-turn into the new chat (pass a session's persisted
+  /// messages when switching to it; empty list for a brand-new chat).
+  Future<void> resetChat({List<Message> history = const []}) async {
+    _chat ??= await _createChat();
+    await _chat!.clearHistory(replayHistory: history);
+  }
+
+  Future<void> stopGeneration() => _chat?.stopGeneration() ?? Future.value();
 
   String _callSignature(String name, Map<String, dynamic> args) {
     final sortedArgs = Map.fromEntries(
