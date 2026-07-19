@@ -41,6 +41,7 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _errorMessage;
   bool _isGenerating = false;
   bool _isSwitchingSession = false;
+  bool _searchMode = false;
 
   @override
   void initState() {
@@ -206,7 +207,7 @@ class _ChatScreenState extends State<ChatScreen> {
     var startedAnswer = false;
     var succeeded = false;
     try {
-      await for (final event in _llm.sendMessage(text)) {
+      await for (final event in _llm.sendMessage(text, searchMode: _searchMode)) {
         switch (event) {
           case AgentToken(:final text):
             setState(() {
@@ -424,6 +425,26 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         SafeArea(
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Checkbox(
+                    value: _searchMode,
+                    visualDensity: VisualDensity.compact,
+                    onChanged: (value) => setState(() => _searchMode = value ?? false),
+                  ),
+                  const Text('検索する'),
+                ],
+              ),
+            ),
+          ),
+        ),
+        SafeArea(
+          top: false,
           child: Padding(
             padding: const EdgeInsets.all(8),
             child: Row(

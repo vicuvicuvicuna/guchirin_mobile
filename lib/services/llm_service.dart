@@ -138,13 +138,60 @@ class LlmService {
         _ => const [],
       };
 
+  /// Forces a single tool call for [text] using the model's own native
+  /// function-calling (same mechanism as the normal auto tool-choice loop —
+  /// just guaranteed instead of left to the model's judgment), via a
+  /// throwaway side chat with `ToolChoice.required` so it doesn't touch the
+  /// ongoing conversation. Returns the arguments the model generated (its
+  /// own extracted `query`, not the raw message) for whichever tool it
+  /// called, or `{'query': text}` as a fail-soft fallback.
+  Future<Map<String, dynamic>> _forceToolCallArgs(String text) async {
+    InferenceChat? sideChat;
+    try {
+      sideChat = await _model!.openChat(
+        tools: tools,
+        supportsFunctionCalls: true,
+        toolChoice: ToolChoice.required,
+        maxOutputTokens: 100,
+      );
+      await sideChat.addQueryChunk(Message.text(text: text, isUser: true));
+      await for (final response in sideChat.generateChatResponseAsync()) {
+        final calls = _extractCalls(response);
+        if (calls.isNotEmpty) return calls.first.args;
+      }
+    } catch (_) {
+      // fall through to the raw-text fallback below
+    } finally {
+      await sideChat?.close();
+    }
+    return {'query': text};
+  }
+
   /// Sends [text] as a user turn and streams the assistant's reply,
   /// running the native tool-call loop (up to [maxAgentSteps] rounds) when
   /// the model requests a tool before answering.
-  Stream<AgentEvent> sendMessage(String text) async* {
+  ///
+  /// If [searchMode] is true, mirrors guchirin_dev's "検索モード" checkbox:
+  /// rather than leaving it to the model's own (unreliable) judgment of
+  /// *whether* to search, [_forceToolCallArgs] guarantees a web_search
+  /// happens for this turn — but still lets the model itself decide *what*
+  /// to search for via its normal function-calling (not the raw message
+  /// text). Results are folded into the model-facing turn as plain context
+  /// (not a native tool-call/response pair, since there's no preceding
+  /// assistant tool-call in the main chat for a response to pair with here).
+  Stream<AgentEvent> sendMessage(String text, {bool searchMode = false}) async* {
     await _ensureChatReady();
     final chat = _chat!;
-    await chat.addQueryChunk(Message.text(text: text, isUser: true));
+
+    var outgoingText = text;
+    if (searchMode) {
+      final args = await _forceToolCallArgs(text);
+      yield AgentToolCall('web_search', args);
+      final result = await toolExecutor!('web_search', args);
+      outgoingText = '$result\n\n$text';
+    }
+
+    await chat.addQueryChunk(Message.text(text: outgoingText, isUser: true));
 
     final seenCalls = <String>{};
 
