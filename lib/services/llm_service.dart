@@ -82,7 +82,10 @@ class LlmService {
       '最新情報・ニュース・特定の事実・固有名詞の確認など、自分の知識だけでは'
       '自信を持って答えられない質問には、遠慮せずweb_searchツールを使って調べてから'
       '回答してください。「分かりません」「知識にありません」で済ませる前に、'
-      'まずツールで調べるようにしてください。';
+      'まずツールで調べるようにしてください。'
+      '各メッセージの末尾には「(現在時刻: ...)」という形で現在の日時が自動的に'
+      '付与されます。日付・曜日・時刻や「今日」「最近」「あと何日」など時間に関する'
+      '質問の場合はこれを参考にし、それ以外の話題では特に触れないでください。';
 
   /// Persona-specific tone instruction appended after [_systemInstruction]
   /// (see PersonaPreset). Empty string uses the base tone only. Settable at
@@ -147,6 +150,16 @@ class LlmService {
     return '$name:${jsonEncode(sortedArgs)}';
   }
 
+  static const _weekdayNames = ['月', '火', '水', '木', '金', '土', '日'];
+
+  String _formatNow(DateTime dt) {
+    final local = dt.toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final weekday = _weekdayNames[local.weekday - 1];
+    return '${local.year}年${local.month}月${local.day}日($weekday) '
+        '${two(local.hour)}:${two(local.minute)}';
+  }
+
   List<FunctionCallResponse> _extractCalls(ModelResponse response) =>
       switch (response) {
         FunctionCallResponse() => [response],
@@ -206,6 +219,12 @@ class LlmService {
       final result = await toolExecutor!('web_search', args);
       outgoingText = '$result\n\n$text';
     }
+    // Freshly fetched every turn (not baked into systemInstruction, which is
+    // only evaluated once at chat creation) so the model always sees the
+    // real current time — hidden from the UI/persisted message, which keep
+    // the user's original [text]. See _systemInstruction for the matching
+    // usage guidance.
+    outgoingText = '$outgoingText\n\n(現在時刻: ${_formatNow(DateTime.now())})';
 
     await chat.addQueryChunk(Message.text(text: outgoingText, isUser: true));
 
