@@ -142,9 +142,13 @@ class _ChatScreenState extends State<ChatScreen> {
     await _loadPersonaSettings();
     final sessionId = _currentSessionId;
     if (sessionId == null || _isGenerating) return;
+    final session = await _repo.getSession(sessionId);
     final records = await _repo.listMessages(sessionId);
-    if (!mounted) return;
-    await _llm.resetChat(history: _buildReplayHistory(records));
+    if (!mounted || session == null) return;
+    final unsummarized = records.length > session.summarizedThrough
+        ? records.sublist(session.summarizedThrough)
+        : const <ChatMessageRecord>[];
+    await _llm.resetChat(history: _buildReplayHistory(unsummarized, summary: session.summary));
   }
 
   Future<void> _initSessions() async {
@@ -168,21 +172,70 @@ class _ChatScreenState extends State<ChatScreen> {
     await _openSession(session);
   }
 
-  /// Bounds how much of a session's history gets replayed into a fresh
-  /// InferenceChat: last [LlmService.historyReplayLimit] messages, each
-  /// truncated to [LlmService.historyReplayMaxCharsPerMessage] chars. See
-  /// llm_service.dart for why this can't rely on the library's own
-  /// context-trimming.
-  List<Message> _buildReplayHistory(List<ChatMessageRecord> records) {
+  /// How many unsummarized messages beyond [LlmService.historyReplayLimit]
+  /// can accumulate before [_maybeCompactContext] folds the oldest of them
+  /// into the session's rolling summary. Keeps compaction infrequent (about
+  /// every 5 exchanges) rather than re-summarizing on every turn.
+  static const _compactionSlack = 10;
+
+  /// Bounds how much of a session's *unsummarized* tail gets replayed into a
+  /// fresh InferenceChat: last [LlmService.historyReplayLimit] messages, each
+  /// truncated to [LlmService.historyReplayMaxCharsPerMessage] chars, with
+  /// [summary] (if any) injected as a leading context turn so older folded
+  /// history isn't simply lost. See llm_service.dart for why bounding this
+  /// can't rely on the library's own context-trimming (it drops silently,
+  /// FIFO, with no summarization).
+  List<Message> _buildReplayHistory(List<ChatMessageRecord> records, {String summary = ''}) {
     final recent = records.length > LlmService.historyReplayLimit
         ? records.sublist(records.length - LlmService.historyReplayLimit)
         : records;
-    return recent.map((record) {
+    final messages = recent.map((record) {
       final content = record.content.length > LlmService.historyReplayMaxCharsPerMessage
           ? record.content.substring(0, LlmService.historyReplayMaxCharsPerMessage)
           : record.content;
       return Message.text(text: content, isUser: record.role == MessageRole.user);
     }).toList();
+    if (summary.isNotEmpty) {
+      messages.insert(
+        0,
+        Message.text(
+          text: '(これまでの会話の要約。今後の応答ではこの内容を踏まえること)\n$summary',
+          isUser: true,
+        ),
+      );
+    }
+    return messages;
+  }
+
+  /// Runs after a turn is persisted: if enough raw messages have piled up
+  /// beyond the live replay window, folds the oldest of them into the
+  /// session's rolling summary (via [LlmService.summarize]) and rebuilds the
+  /// live chat context from summary + remaining recent turns. Fails soft —
+  /// a summarization error just leaves compaction to retry next turn,
+  /// falling back on flutter_gemma's own (cruder) trimming in the meantime.
+  Future<void> _maybeCompactContext(String sessionId) async {
+    try {
+      final session = await _repo.getSession(sessionId);
+      if (session == null) return;
+      final records = await _repo.listMessages(sessionId);
+      final unsummarizedCount = records.length - session.summarizedThrough;
+      if (unsummarizedCount <= LlmService.historyReplayLimit + _compactionSlack) return;
+
+      final newSummarizedThrough = records.length - LlmService.historyReplayLimit;
+      final toFold = records.sublist(session.summarizedThrough, newSummarizedThrough);
+      final newSummary = await _llm.summarize(
+        previousSummary: session.summary,
+        turns: toFold.map((r) => (isUser: r.role == MessageRole.user, text: r.content)).toList(),
+      );
+      await _repo.updateSummary(sessionId, summary: newSummary, summarizedThrough: newSummarizedThrough);
+      unawaited(_refreshSessions());
+
+      if (!mounted || sessionId != _currentSessionId) return;
+      final recent = records.sublist(newSummarizedThrough);
+      await _llm.resetChat(history: _buildReplayHistory(recent, summary: newSummary));
+    } catch (_) {
+      // Fail soft — see doc comment above.
+    }
   }
 
   Future<void> _openSession(Session session) async {
@@ -190,6 +243,10 @@ class _ChatScreenState extends State<ChatScreen> {
       await _llm.stopGeneration();
     }
     setState(() => _isSwitchingSession = true);
+    // Re-fetched rather than trusting `session.summary`/`summarizedThrough`:
+    // the caller's copy (from the cached _sessions list) may be stale if a
+    // compaction pass updated it since the last _refreshSessions().
+    final fresh = await _repo.getSession(session.id) ?? session;
     final records = await _repo.listMessages(session.id);
     if (!mounted) return;
     setState(() {
@@ -200,7 +257,10 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _scrollToBottom();
     try {
-      await _llm.resetChat(history: _buildReplayHistory(records));
+      final unsummarized = records.length > fresh.summarizedThrough
+          ? records.sublist(fresh.summarizedThrough)
+          : const <ChatMessageRecord>[];
+      await _llm.resetChat(history: _buildReplayHistory(unsummarized, summary: fresh.summary));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -307,8 +367,6 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       setState(() => _messages.last.text = '[エラー] 応答生成に失敗しました: $e');
-    } finally {
-      setState(() => _isGenerating = false);
     }
 
     // Only persist if a real answer was streamed (startedAnswer), not a
@@ -318,7 +376,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (succeeded && startedAnswer && _messages.last.text.isNotEmpty) {
       await _repo.addMessage(sessionId, isUser: false, content: _messages.last.text);
       unawaited(_refreshSessions());
+      // Kept under _isGenerating (input stays disabled) since compaction
+      // may rebuild _llm's live chat/KV-cache via resetChat — letting the
+      // user send another message concurrently would race with that.
+      await _maybeCompactContext(sessionId);
     }
+    if (mounted) setState(() => _isGenerating = false);
   }
 
   void _scrollToBottom() {

@@ -32,6 +32,30 @@ class SessionRepository {
     return rows.map(Session.fromMap).toList();
   }
 
+  Future<Session?> getSession(String sessionId) async {
+    final db = await _dbService.database;
+    final rows = await db.query('sessions', where: 'id = ?', whereArgs: [sessionId]);
+    if (rows.isEmpty) return null;
+    return Session.fromMap(rows.first);
+  }
+
+  /// Persists the result of a context-compaction pass (see
+  /// LlmService.summarize): [summary] replaces the prior recap and
+  /// [summarizedThrough] advances to mark those messages as folded in.
+  Future<void> updateSummary(
+    String sessionId, {
+    required String summary,
+    required int summarizedThrough,
+  }) async {
+    final db = await _dbService.database;
+    await db.update(
+      'sessions',
+      {'summary': summary, 'summarized_through': summarizedThrough},
+      where: 'id = ?',
+      whereArgs: [sessionId],
+    );
+  }
+
   Future<List<ChatMessageRecord>> listMessages(String sessionId) async {
     final db = await _dbService.database;
     final rows = await db.query(

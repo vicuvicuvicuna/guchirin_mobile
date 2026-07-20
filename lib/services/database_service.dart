@@ -31,14 +31,16 @@ class DatabaseService {
     return openDatabase(
       path,
       password: passphrase,
-      version: 1,
+      version: 2,
       onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE sessions (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            summarized_through INTEGER NOT NULL DEFAULT 0
           )
         ''');
         await db.execute('''
@@ -52,6 +54,18 @@ class DatabaseService {
           )
         ''');
         await db.execute('CREATE INDEX idx_messages_session_id ON messages(session_id)');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // Rolling context-compaction summary (see SessionRepository/LlmService.summarize):
+          // `summary` holds the folded-down recap of older turns, and
+          // `summarized_through` is how many of the session's messages (in
+          // created_at order) are already covered by it.
+          await db.execute("ALTER TABLE sessions ADD COLUMN summary TEXT NOT NULL DEFAULT ''");
+          await db.execute(
+            'ALTER TABLE sessions ADD COLUMN summarized_through INTEGER NOT NULL DEFAULT 0',
+          );
+        }
       },
     );
   }

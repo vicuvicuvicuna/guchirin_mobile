@@ -246,6 +246,49 @@ class LlmService {
     }
   }
 
+  /// Folds [previousSummary] (empty if none yet) and [turns] (older,
+  /// about-to-be-dropped-from-replay messages, oldest first) into a single
+  /// compact recap for context compaction (see chat_screen.dart's
+  /// _maybeCompactContext). Runs on a throwaway side chat, same pattern as
+  /// [_forceToolCallArgs], so it doesn't touch the ongoing conversation's
+  /// KV-cache/history.
+  Future<String> summarize({
+    required String previousSummary,
+    required List<({bool isUser, String text})> turns,
+  }) async {
+    final prompt = StringBuffer();
+    if (previousSummary.isNotEmpty) {
+      prompt
+        ..writeln('これまでの会話の要約:')
+        ..writeln(previousSummary)
+        ..writeln();
+    }
+    prompt.writeln('その後のやり取り:');
+    for (final turn in turns) {
+      prompt.writeln('${turn.isUser ? "ユーザー" : "アシスタント"}: ${turn.text}');
+    }
+    prompt.writeln();
+    prompt.writeln(
+      '上記の「これまでの会話の要約」と「その後のやり取り」を、今後の会話で参照できるよう'
+      '一つの要約にまとめ直してください。決まった事柄・重要な固有名詞や数値・ユーザーの意図や'
+      '好みを漏らさず、日本語で300字程度、要約文のみを出力してください。',
+    );
+
+    InferenceChat? sideChat;
+    try {
+      sideChat = await _model!.openChat(supportsFunctionCalls: false, maxOutputTokens: 400);
+      await sideChat.addQueryChunk(Message.text(text: prompt.toString(), isUser: true));
+      final buffer = StringBuffer();
+      await for (final response in sideChat.generateChatResponseAsync()) {
+        if (response is TextResponse) buffer.write(response.token);
+      }
+      final result = buffer.toString().trim();
+      return result.isEmpty ? previousSummary : result;
+    } finally {
+      await sideChat?.close();
+    }
+  }
+
   Future<void> dispose() async {
     await _model?.close();
     _model = null;
