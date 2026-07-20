@@ -50,7 +50,12 @@ class LlmService {
   // routinely exceeded it even after truncation; 8192 is a middle ground —
   // watch for OOM on lower-RAM devices if raising further.
   static const contextWindow = 8192;
-  static const answerMaxTokens = 800;
+
+  /// Per-turn output cap. Mutable (unlike the other tuning constants above)
+  /// because it's driven by the selected persona's reply-length setting
+  /// (see PersonaPreset/ResponseLength) rather than fixed at build time —
+  /// set it before the next [resetChat]/chat creation to apply a change.
+  int answerMaxTokens = 450;
 
   // Mirrors backend/config.py's MAX_AGENT_STEPS: caps the tool-call decision
   // loop so a model that never converges on a final answer can't loop
@@ -72,10 +77,21 @@ class LlmService {
   static const _systemInstruction =
       '回答は要点を絞り、必要十分な長さで簡潔に答えてください。'
       '過剰な見出し・箇条書き・表・絵文字の多用は避け、自然な文章を基本としてください。'
+      '出力できる長さには上限があるため、長くなりそうな内容でも早めに結論を述べ、'
+      '尻切れにならないよう要点だけで締めくくってください。'
       '最新情報・ニュース・特定の事実・固有名詞の確認など、自分の知識だけでは'
       '自信を持って答えられない質問には、遠慮せずweb_searchツールを使って調べてから'
       '回答してください。「分かりません」「知識にありません」で済ませる前に、'
       'まずツールで調べるようにしてください。';
+
+  /// Persona-specific tone instruction appended after [_systemInstruction]
+  /// (see PersonaPreset). Empty string uses the base tone only. Settable at
+  /// any time; only takes effect on the next chat (re)creation — call
+  /// [resetChat] afterward to apply a change to the current session.
+  String personaInstruction = '';
+
+  String get _effectiveSystemInstruction =>
+      personaInstruction.isEmpty ? _systemInstruction : '$_systemInstruction\n\n$personaInstruction';
 
   InferenceModel? _model;
   InferenceChat? _chat;
@@ -100,7 +116,7 @@ class LlmService {
     return _model!.createChat(
       modelType: modelType,
       maxOutputTokens: answerMaxTokens,
-      systemInstruction: _systemInstruction,
+      systemInstruction: _effectiveSystemInstruction,
       tools: tools,
       supportsFunctionCalls: tools.isNotEmpty,
       toolChoice: ToolChoice.auto,

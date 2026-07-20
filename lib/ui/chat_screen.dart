@@ -8,8 +8,14 @@ import '../models/session.dart';
 import '../services/database_service.dart';
 import '../services/llm_service.dart';
 import '../services/session_repository.dart';
+import '../services/settings_service.dart';
 import '../services/tools.dart';
 import 'settings_screen.dart';
+
+/// Reply text is considered probably cut off mid-thought if it doesn't end
+/// on one of these — flutter_gemma exposes no finish-reason, so this is a
+/// heuristic stand-in for "did the maxOutputTokens cap bite".
+const _sentenceEnders = {'。', '！', '？', '」', '』', '.', '!', '?', '"', "'", ')', '）'};
 
 class _ChatMessage {
   _ChatMessage({required this.isUser, required this.text});
@@ -30,6 +36,7 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final _llm = LlmService(tools: availableTools(), toolExecutor: executeTool);
   final _repo = SessionRepository(DatabaseService.instance);
+  final _settings = SettingsService();
   final _textController = TextEditingController();
   final _scrollController = ScrollController();
   final List<_ChatMessage> _messages = [];
@@ -54,7 +61,10 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _status = installed ? _ModelStatus.ready : _ModelStatus.needsDownload;
     });
-    if (installed) await _initSessions();
+    if (installed) {
+      await _loadPersonaSettings();
+      await _initSessions();
+    }
   }
 
   Future<void> _downloadModel() async {
@@ -68,6 +78,7 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() => _downloadProgress = progress);
       }
       setState(() => _status = _ModelStatus.ready);
+      await _loadPersonaSettings();
       await _initSessions();
     } catch (e) {
       setState(() {
@@ -75,6 +86,28 @@ class _ChatScreenState extends State<ChatScreen> {
         _errorMessage = 'モデルのダウンロードに失敗しました: $e';
       });
     }
+  }
+
+  /// Pulls the persona/tone and reply-length settings into [_llm]. Only
+  /// takes effect on the next chat creation, so callers that need it to
+  /// apply to the *current* session must also reset the chat (see
+  /// [_reloadPersona]).
+  Future<void> _loadPersonaSettings() async {
+    _llm.personaInstruction = await _settings.getPersonaInstruction();
+    _llm.answerMaxTokens = await _settings.getPersonaMaxTokens();
+  }
+
+  /// Called when the settings screen saves a persona change: reloads the
+  /// setting and rebuilds the current session's chat (fresh KV-cache,
+  /// history replayed) so the new tone/length applies immediately instead of
+  /// waiting for the next session switch.
+  Future<void> _reloadPersona() async {
+    await _loadPersonaSettings();
+    final sessionId = _currentSessionId;
+    if (sessionId == null || _isGenerating) return;
+    final records = await _repo.listMessages(sessionId);
+    if (!mounted) return;
+    await _llm.resetChat(history: _buildReplayHistory(records));
   }
 
   Future<void> _initSessions() async {
@@ -229,6 +262,12 @@ class _ChatScreenState extends State<ChatScreen> {
         _scrollToBottom();
       }
       succeeded = true;
+      if (startedAnswer) {
+        final trimmed = _messages.last.text.trimRight();
+        if (trimmed.isNotEmpty && !_sentenceEnders.contains(trimmed[trimmed.length - 1])) {
+          setState(() => _messages.last.text = '$trimmed…');
+        }
+      }
     } catch (e) {
       setState(() => _messages.last.text = '[エラー] 応答生成に失敗しました: $e');
     } finally {
@@ -279,7 +318,7 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+              MaterialPageRoute(builder: (_) => SettingsScreen(onSaved: _reloadPersona)),
             ),
           ),
         ],
