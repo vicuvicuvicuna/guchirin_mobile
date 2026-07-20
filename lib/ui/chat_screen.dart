@@ -24,7 +24,42 @@ class _ChatMessage {
   String text;
 }
 
-enum _ModelStatus { checking, needsDownload, downloading, ready, error }
+enum _ModelStatus { checking, needsDownload, downloading, loadingModel, ready, error }
+
+/// Label followed by an animated 0-3 dot ellipsis (e.g. "読み込み中" -> "読み込み中..."),
+/// so long-running steps with no numeric progress (model weight load, chat
+/// warm-up) still read as "in progress" rather than a frozen screen.
+class _LoadingDots extends StatefulWidget {
+  const _LoadingDots({required this.label});
+
+  final String label;
+
+  @override
+  State<_LoadingDots> createState() => _LoadingDotsState();
+}
+
+class _LoadingDotsState extends State<_LoadingDots> {
+  late final Timer _timer;
+  int _dots = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 400),
+      (_) => setState(() => _dots = (_dots + 1) % 4),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Text('${widget.label}${'.' * _dots}');
+}
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -58,13 +93,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _checkModel() async {
     final installed = await _llm.isInstalled();
-    setState(() {
-      _status = installed ? _ModelStatus.ready : _ModelStatus.needsDownload;
-    });
-    if (installed) {
-      await _loadPersonaSettings();
-      await _initSessions();
+    if (!installed) {
+      setState(() => _status = _ModelStatus.needsDownload);
+      return;
     }
+    setState(() => _status = _ModelStatus.loadingModel);
+    await _loadPersonaSettings();
+    await _initSessions();
+    if (mounted) setState(() => _status = _ModelStatus.ready);
   }
 
   Future<void> _downloadModel() async {
@@ -77,9 +113,10 @@ class _ChatScreenState extends State<ChatScreen> {
       await for (final progress in _llm.install()) {
         setState(() => _downloadProgress = progress);
       }
-      setState(() => _status = _ModelStatus.ready);
+      setState(() => _status = _ModelStatus.loadingModel);
       await _loadPersonaSettings();
       await _initSessions();
+      if (mounted) setState(() => _status = _ModelStatus.ready);
     } catch (e) {
       setState(() {
         _status = _ModelStatus.error;
@@ -325,9 +362,10 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       drawer: _status == _ModelStatus.ready ? _buildSessionDrawer() : null,
       body: switch (_status) {
-        _ModelStatus.checking => const Center(child: CircularProgressIndicator()),
+        _ModelStatus.checking => _buildFullScreenLoading('起動しています'),
         _ModelStatus.needsDownload => _buildDownloadPrompt(),
         _ModelStatus.downloading => _buildDownloadProgress(),
+        _ModelStatus.loadingModel => _buildFullScreenLoading('モデルを読み込んでいます'),
         _ModelStatus.error => _buildError(),
         _ModelStatus.ready => _buildChat(),
       },
@@ -376,6 +414,22 @@ class _ChatScreenState extends State<ChatScreen> {
                 },
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFullScreenLoading(String label) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            _LoadingDots(label: label),
           ],
         ),
       ),
